@@ -45,9 +45,10 @@ def flash_attention_fwd_kernel(
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vk, stride_vd,
     stride_ob, stride_oh, stride_om, stride_od,
-    B, H, seq_len, head_dim,
+    B, H, seq_len,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
     sm_scale: tl.constexpr,
 ):
     """FlashAttention forward — fill in the algorithm above."""
@@ -63,7 +64,7 @@ def flash_attention_fwd_kernel(
     # Offsets for this Q block
     offs_m = block_m * BLOCK_M + tl.arange(0, BLOCK_M)   # [BLOCK_M]
     offs_n = tl.arange(0, BLOCK_N)                        # [BLOCK_N]
-    offs_d = tl.arange(0, head_dim)                       # [head_dim]
+    offs_d = tl.arange(0, BLOCK_D)                        # [head_dim]
 
     # ── YOUR CODE HERE ──
     # 1. Load Q block [BLOCK_M, head_dim]
@@ -75,7 +76,30 @@ def flash_attention_fwd_kernel(
     #    d. Accumulate output
     # 4. Store result to o_ptr
     # ── END ──
-    pass
+    Q = tl.load(q_ptr + b_idx * stride_qb + h_idx * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    m = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    d = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+    for block_n in range(tl.cdiv(seq_len, BLOCK_N)):
+        # Load K and V with block_n offset
+        kn_base = b_idx * stride_kb + h_idx * stride_kh + block_n * BLOCK_N * stride_kn
+        vn_base = b_idx * stride_vb + h_idx * stride_vh + block_n * BLOCK_N * stride_vk
+
+        K = tl.load(k_ptr + kn_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                    mask=offs_n[:, None] < seq_len, other=0.0)
+        V = tl.load(v_ptr + vn_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vd,
+                    mask=offs_n[:, None] < seq_len, other=0.0)
+        S = tl.dot(Q.to(tl.float32), tl.trans(K).to(tl.float32)) * sm_scale
+        m_new = tl.maximum(m, tl.max(S, axis=1))
+        P = tl.exp(S - m_new[:, None])
+        d_new = d * tl.exp(m - m_new) + tl.sum(P, axis=1)
+        acc = acc * (d / d_new)[:, None] * tl.exp(m - m_new)[:, None] + tl.dot(P.to(tl.float32), V.to(tl.float32)) / d_new[:, None]
+        m = m_new
+        d = d_new
+    # Mask for storing output
+    mask = offs_m < seq_len
+    tl.store(o_ptr + b_idx * stride_ob + h_idx * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od, acc, mask=mask[:, None])
+
 
 
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -96,8 +120,8 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        B, H, seq_len, head_dim,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        B, H, seq_len,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=head_dim,
         sm_scale=sm_scale,
     )
     return o

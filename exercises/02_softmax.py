@@ -31,14 +31,26 @@ def softmax_2pass_kernel(x_ptr, output_ptr, n_rows, n_cols, BLOCK_SIZE: tl.const
     """2-pass stable softmax: first pass max, second pass normalize."""
     row_idx = tl.program_id(0)
     row_start = row_idx * n_cols
-
+    max_num = -float('inf')
     # ── YOUR CODE: Pass 1 — find max ──
     # Loop over chunks of this row, accumulate the max
     # ──
 
+    for col_idx in range(n_cols):
+        max_num = tl.maximum(max_num, tl.load(x_ptr + row_start + col_idx))
     # ── YOUR CODE: Pass 2 — compute exp(x-max) / sum(exp(x-max)) ──
     # Loop again, first accumulate sum, then store normalized values
     # ──
+    sum_exp = 0.0
+    for col_idx in range(n_cols):
+        x = tl.load(x_ptr + row_start + col_idx)
+        exp_x = tl.exp(x - max_num)
+        sum_exp += exp_x
+
+    for col_idx in range(n_cols):
+        x = tl.load(x_ptr + row_start + col_idx)
+        exp_x = tl.exp(x - max_num)
+        tl.store(output_ptr + row_start + col_idx, exp_x / sum_exp)
 
 
 @triton.jit
@@ -55,7 +67,19 @@ def softmax_online_kernel(x_ptr, output_ptr, n_rows, n_cols, BLOCK_SIZE: tl.cons
     #   m = m_new
     # Then second loop: output = exp(x_i - m) / d
     # ──
-
+    m = -float('inf')
+    d = 0.0
+    for col_idx in range(n_cols):
+        x = tl.load(x_ptr + row_start + col_idx)
+        m_new = tl.maximum(m, x)
+        d_new = d * tl.exp(m - m_new) + tl.exp(x - m_new)
+        m = m_new
+        d = d_new
+    
+    for col_idx in range(n_cols):
+        x = tl.load(x_ptr + row_start + col_idx)
+        exp_x = tl.exp(x - m)
+        tl.store(output_ptr + row_start + col_idx, exp_x / d)
 
 # ─── Test ───────────────────────────────────────────────────
 def test_softmax():

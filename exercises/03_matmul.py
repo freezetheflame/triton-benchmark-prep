@@ -58,8 +58,25 @@ def matmul_kernel(
     #      acc += tl.dot(a, b)
     # 6. mask and store to c_ptr
     # ── END ──
-    pass
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+      rk = k + tl.arange(0, BLOCK_K)
+      a_off = a_ptr + (rm[:, None] * stride_am + rk[None, :] * stride_ak)
+      b_off = b_ptr + (rk[:, None] * stride_bk + rn[None, :] * stride_bn)
+      a_mask = (rm[:, None] < M) & (rk[None, :] < K)
+      b_mask = (rk[:, None] < K) & (rn[None, :] < N)
+      a = tl.load(a_off, mask=a_mask, other=0.0)
+      b = tl.load(b_off, mask=b_mask, other=0.0)
+      acc += tl.dot(a, b)
+
+    c_mask = (rm[:, None] < M) & (rn[None, :] < N)
+    tl.store(c_ptr + (rm[:, None] * stride_cm + rn[None, :] * stride_cn), acc, mask=c_mask)
 
 def matmul(a: torch.Tensor, b: torch.Tensor, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32):
     M, K = a.shape

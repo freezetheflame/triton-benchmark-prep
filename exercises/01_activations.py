@@ -40,7 +40,7 @@ def gelu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     x = tl.load(x_ptr + offsets, mask=mask)
     # ── YOUR CODE ──
     # Hint: sqrt(2/π) ≈ 0.7978845608
-    temp = 0.7978845608*(x+ 0.044715*x^3)
+    temp = 0.7978845608*(x+ 0.044715*x*x*x)
     temp2 = (tl.exp(2*temp) - 1) / (tl.exp(2*temp) + 1)
     y = 0.5 * x * (1 + temp2)
     tl.store(output_ptr+offsets,y,mask=mask)
