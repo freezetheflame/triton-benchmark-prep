@@ -415,34 +415,57 @@ def print_autotune_guide():
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print_header()
-    timer = GPUTimer(warmup_iters=10)
-    all_results = []
+    import sys
+    from datetime import datetime
 
-    print("\n[1/4] Profiling Element-wise Ops (ReLU, GELU)...")
-    all_results.extend(profile_elementwise(timer))
+    # Setup output file
+    os.makedirs("profiles", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = f"profiles/report_{timestamp}.txt"
+    log_file = open(report_path, 'w', encoding='utf-8')
 
-    print("[2/4] Profiling Softmax...")
-    all_results.extend(profile_softmax(timer))
+    # Tee: write to both terminal and file
+    class Tee:
+        def __init__(self, *files):
+            self.files = files
+        def write(self, text):
+            for f in self.files:
+                f.write(text)
+                f.flush()
+        def flush(self):
+            for f in self.files:
+                f.flush()
 
-    print("[3/4] Profiling Matmul...")
-    all_results.extend(profile_matmul(timer))
+    original_stdout = sys.stdout
+    sys.stdout = Tee(original_stdout, log_file)
 
-    print("[4/4] Profiling Attention (SDPA)...")
-    all_results.extend(profile_flash_attention(timer))
+    try:
+        print_header()
+        timer = GPUTimer(warmup_iters=10)
+        all_results = []
 
-    # Print individual results
-    for p in all_results:
-        print_profile(p)
+        print("\n[1/4] Profiling Element-wise Ops (ReLU, GELU)...")
+        all_results.extend(profile_elementwise(timer))
 
-    # Print summary
-    print_summary(all_results)
-    print_autotune_guide()
+        print("[2/4] Profiling Softmax...")
+        all_results.extend(profile_softmax(timer))
 
-    print(f"\n{'='*95}")
-    print("  EXERCISE: Answer these questions")
-    print(f"{'='*95}")
-    print("""
+        print("[3/4] Profiling Matmul...")
+        all_results.extend(profile_matmul(timer))
+
+        print("[4/4] Profiling Attention (SDPA)...")
+        all_results.extend(profile_flash_attention(timer))
+
+        for p in all_results:
+            print_profile(p)
+
+        print_summary(all_results)
+        print_autotune_guide()
+
+        print(f"\n{'='*95}")
+        print("  EXERCISE: Answer these questions")
+        print(f"{'='*95}")
+        print("""
   1. Which kernels are memory-bound? Why?
   2. Which kernels are compute-bound? Why?
   3. Why does Matmul achieve higher % of peak FLOPS than Softmax?
@@ -452,3 +475,11 @@ if __name__ == "__main__":
      and record register/shared memory for each kernel.
   6. Which kernel has the most room for improvement? Propose a change.
   """)
+
+    finally:
+        sys.stdout = original_stdout
+        log_file.close()
+
+    print(f"\nReport saved to: {report_path}")
+    print(f"  cat {report_path}   # view")
+    print(f"  ls profiles/        # list all reports")
