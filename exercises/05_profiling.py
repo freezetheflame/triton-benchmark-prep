@@ -392,22 +392,68 @@ def print_summary(all_results: List[KernelProfile]):
         print(f"    → Optimize: use Tensor Core, tune num_warps, reduce register pressure")
 
 
-def print_autotune_guide():
+def print_kernel_compilation_stats():
+    """Extract compilation metadata from compiled kernels: shared memory, num_warps, num_stages.
+    
+    Note: Per-thread register count is NOT available from PTX-level virtual registers
+    (they get heavily reduced by ptxas). To get actual register usage, either:
+      A) Use @triton.autotune with TRITON_PRINT_AUTOTUNING=1
+      B) Use Nsight Compute (ncu --set full)
+    """
     print(f"\n\n{'='*95}")
-    print("  AUTOTUNE GUIDE — Run with: TRITON_PRINT_AUTOTUNING=1 python exercises/05_profiling.py")
+    print("  KERNEL COMPILATION METADATA (from compiled kernel)")
+    print(f"  Note: Register count requires autotune or Nsight — see guide below")
     print(f"{'='*95}")
-    print("""
-  For each kernel, check:
-    1. n_regs — register usage per thread (lower = better occupancy)
-       - < 64: excellent
-       - 64-128: normal
-       - > 128: potential spill risk
-    2. n_spills — register spills to local memory (0 is ideal)
-    3. shared_mem — bytes of shared memory per block
-       - < 48 KB: fits in 1 wave per SM
-       - 48-100 KB: fits but limits occupancy
-    4. occupancy — % of theoretical max warps
-  """)
+    
+    # Trigger compilation of all kernels by doing a tiny run
+    N = 1024
+    x = torch.randn(N, device='cuda')
+    out = torch.empty_like(x)
+    relu_kernel[(1,)](x, out, N, BLOCK_SIZE=1024)
+    
+    x = torch.randn(N, device='cuda')
+    out = torch.empty_like(x)
+    gelu_kernel[(1,)](x, out, N, BLOCK_SIZE=1024)
+    
+    x = torch.randn(4, 256, device='cuda')
+    out = torch.empty_like(x)
+    softmax_online_kernel[(4,)](x, out, 4, 256, BLOCK_SIZE=256)
+    
+    a = torch.randn(128, 128, device='cuda', dtype=torch.float16)
+    b = torch.randn(128, 128, device='cuda', dtype=torch.float16)
+    c = torch.empty(128, 128, device='cuda', dtype=torch.float16)
+    matmul_kernel[(1,1)](a, b, c, 128, 128, 128, 128, 1, 128, 1, 128, 1,
+                         BLOCK_M=128, BLOCK_N=128, BLOCK_K=32)
+    
+    kernels_info = [
+        ("ReLU", relu_kernel),
+        ("GELU", gelu_kernel),
+        ("Softmax", softmax_online_kernel),
+        ("Matmul", matmul_kernel),
+    ]
+    
+    print(f"\n  {'Kernel':<12} {'shmem(KB)':>10} {'num_warps':>10} {'num_stages':>11} {'threads/block':>14}")
+    print(f"  {'─'*12} {'─'*10} {'─'*10} {'─'*11} {'─'*14}")
+    
+    for name, kernel in kernels_info:
+        try:
+            for dev, binder in kernel.device_caches.items():
+                kernel_cache, _, _, _, _ = binder
+                if kernel_cache:
+                    compiled = list(kernel_cache.values())[0]
+                    md = compiled.metadata
+                    shmem_kb = md.shared / 1024 if md.shared else 0
+                    threads = md.num_warps * 32
+                    print(f"  {name:<12} {shmem_kb:>10.1f} {md.num_warps:>10} {md.num_stages:>11} {threads:>14}")
+                break
+        except Exception as e:
+            print(f"  {name:<12} {'FAILED':>8} — {str(e)[:50]}")
+    
+    print(f"\n  How to get actual register usage:")
+    print(f"    1. Add @triton.autotune to your kernel, then:")
+    print(f"       TRITON_PRINT_AUTOTUNING=1 python my_kernel.py")
+    print(f"    2. Or use Nsight Compute:")
+    print(f"       ncu --set full python my_kernel.py  # shows per-thread reg count")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -460,7 +506,7 @@ if __name__ == "__main__":
             print_profile(p)
 
         print_summary(all_results)
-        print_autotune_guide()
+        print_kernel_compilation_stats()
 
         print(f"\n{'='*95}")
         print("  EXERCISE: Answer these questions")
@@ -471,8 +517,8 @@ if __name__ == "__main__":
   3. Why does Matmul achieve higher % of peak FLOPS than Softmax?
   4. Why is FlashAttention faster than naive attention even though
      it does the same FLOPs? (Hint: look at bytes moved)
-  5. Run: TRITON_PRINT_AUTOTUNING=1 python exercises/05_profiling.py
-     and record register/shared memory for each kernel.
+  5. Look at the COMPILATION METADATA section. Why does Matmul need
+     shared memory (32 KB) but ReLU/Softmax don't (0 KB)?
   6. Which kernel has the most room for improvement? Propose a change.
   """)
 
