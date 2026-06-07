@@ -67,19 +67,24 @@ def softmax_online_kernel(x_ptr, output_ptr, n_rows, n_cols, BLOCK_SIZE: tl.cons
     #   m = m_new
     # Then second loop: output = exp(x_i - m) / d
     # ──
-    m = -float('inf')
-    d = 0.0
-    for col_idx in range(n_cols):
-        x = tl.load(x_ptr + row_start + col_idx)
-        m_new = tl.maximum(m, x)
-        d_new = d * tl.exp(m - m_new) + tl.exp(x - m_new)
+    m = tl.full((), -float('inf'), tl.float32)
+    d = tl.zeros((), dtype=tl.float32)
+    for col_idx in range(0,n_cols,BLOCK_SIZE):
+        offs = col_idx + tl.arange(0, BLOCK_SIZE)
+        mask = offs < n_cols
+        x = tl.load(x_ptr + row_start + offs, mask=mask, other=-float('inf'))
+        block_max = tl.max(x, axis=0)
+        m_new = tl.maximum(m, block_max)
+        d_new = d * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new), axis=0)
         m = m_new
         d = d_new
     
-    for col_idx in range(n_cols):
-        x = tl.load(x_ptr + row_start + col_idx)
+    for col_idx in range(0,n_cols, BLOCK_SIZE):
+        offs = col_idx + tl.arange(0, BLOCK_SIZE)
+        mask = offs < n_cols
+        x = tl.load(x_ptr + row_start + offs, mask=mask)
         exp_x = tl.exp(x - m)
-        tl.store(output_ptr + row_start + col_idx, exp_x / d)
+        tl.store(output_ptr + row_start + offs, exp_x / d, mask=mask)
 
 # ─── Test ───────────────────────────────────────────────────
 def test_softmax():
