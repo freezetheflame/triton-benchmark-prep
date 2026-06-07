@@ -292,43 +292,197 @@ def profile_matmul(timer: GPUTimer) -> List[KernelProfile]:
     return results
 
 
-def profile_flash_attention(timer: GPUTimer) -> List[KernelProfile]:
-    """Profile FlashAttention (compute-bound, I/O optimal)."""
-    # Use a simplified version — the full FA kernel is complex
-    # This profiles the attention matmul portions to estimate
+# ═══════════════════════════════════════════════════════════
+#  TRITON FLASH ATTENTION KERNEL (from exercise 04)
+# ═══════════════════════════════════════════════════════════
+
+@triton.jit
+def fa_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
+              stride_qb, stride_qh, stride_qm, stride_qd,
+              stride_kb, stride_kh, stride_kn, stride_kd,
+              stride_vb, stride_vh, stride_vk, stride_vd,
+              stride_ob, stride_oh, stride_om, stride_od,
+              B, H, seq_len,
+              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+              BLOCK_D: tl.constexpr, sm_scale: tl.constexpr):
+    """FlashAttention forward — online softmax over K,V tiles."""
+    pid = tl.program_id(0)
+    num_m_blocks = tl.cdiv(seq_len, BLOCK_M)
+    bh_id = pid // num_m_blocks
+    block_m = pid % num_m_blocks
+    b_idx = bh_id // H
+    h_idx = bh_id % H
+
+    offs_m = block_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    Q = tl.load(q_ptr + b_idx * stride_qb + h_idx * stride_qh
+                + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+
+    m = tl.full((BLOCK_M,), -float('inf'), dtype=tl.float32)
+    d = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+
+    for block_n in range(tl.cdiv(seq_len, BLOCK_N)):
+        kn_base = b_idx * stride_kb + h_idx * stride_kh + block_n * BLOCK_N * stride_kn
+        vn_base = b_idx * stride_vb + h_idx * stride_vh + block_n * BLOCK_N * stride_vk
+
+        K = tl.load(k_ptr + kn_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                    mask=offs_n[:, None] < seq_len, other=0.0)
+        V = tl.load(v_ptr + vn_base + offs_n[:, None] * stride_vk + offs_d[None, :] * stride_vd,
+                    mask=offs_n[:, None] < seq_len, other=0.0)
+
+        S = tl.dot(Q.to(tl.float32), tl.trans(K).to(tl.float32)) * sm_scale
+        m_new = tl.maximum(m, tl.max(S, axis=1))
+        P = tl.exp(S - m_new[:, None])
+        d_new = d * tl.exp(m - m_new) + tl.sum(P, axis=1)
+        acc = (acc * (d / d_new)[:, None] * tl.exp(m - m_new)[:, None]
+               + tl.dot(P.to(tl.float32), V.to(tl.float32)) / d_new[:, None])
+        m, d = m_new, d_new
+
+    mask = offs_m < seq_len
+    tl.store(o_ptr + b_idx * stride_ob + h_idx * stride_oh
+             + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
+             acc, mask=mask[:, None])
+
+
+def triton_flash_attention(q, k, v, sm_scale=None):
+    """Wrapper for the Triton FlashAttention kernel."""
+    B, H, seq_len, head_dim = q.shape
+    if sm_scale is None:
+        sm_scale = 1.0 / (head_dim ** 0.5)
+
+    o = torch.empty_like(q)
+    BLOCK_M, BLOCK_N = 64, 64
+    grid = (triton.cdiv(seq_len, BLOCK_M) * B * H,)
+
+    fa_kernel[grid](
+        q, k, v, o,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        B, H, seq_len,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=head_dim,
+        sm_scale=sm_scale,
+    )
+    return o
+
+
+def profile_attention_all(timer: GPUTimer) -> List[KernelProfile]:
+    """Profile three attention implementations:
+      1. Naive PyTorch (O(S²) memory, stores full S matrix)
+      2. Triton FlashAttention (O(1) memory, online softmax)
+      3. PyTorch SDPA (cuDNN FlashAttention, fastest)
+    
+    Same FLOPs, vastly different memory footprints.
+    """
     results = []
 
-    # Attention: S = Q @ K^T / sqrt(d), then softmax, then P @ V
-    batch, heads, seq_len, head_dim = 4, 8, 4096, 64
-    q = torch.randn(batch, heads, seq_len, head_dim, device='cuda', dtype=torch.float16)
-    k = torch.randn(batch, heads, seq_len, head_dim, device='cuda', dtype=torch.float16)
-    v = torch.randn(batch, heads, seq_len, head_dim, device='cuda', dtype=torch.float16)
+    # Medium size — naive attention still fits in VRAM
+    B, H, seq_len, head_dim = 2, 8, 2048, 64
+    q = torch.randn(B, H, seq_len, head_dim, device='cuda', dtype=torch.float16)
+    k = torch.randn(B, H, seq_len, head_dim, device='cuda', dtype=torch.float16)
+    v = torch.randn(B, H, seq_len, head_dim, device='cuda', dtype=torch.float16)
 
-    # PyTorch SDPA baseline
-    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
-        torch_ms = timer.measure(
-            lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v))
+    sm_scale = 1.0 / (head_dim ** 0.5)
 
-    # FLOPs for attention: Q@K^T: 2*B*H*S*S*d, softmax: ~5*B*H*S*S, P@V: 2*B*H*S*S*d
+    # ── 1. Naive attention ──
+    def naive_attn():
+        qf = q.float()
+        kf = k.float()
+        vf = v.float()
+        S = torch.matmul(qf, kf.transpose(-2, -1)) * sm_scale
+        P = torch.softmax(S, dim=-1)
+        return torch.matmul(P, vf)
+
+    naive_ms = timer.measure(naive_attn)
+
+    # ── 2. Triton FlashAttention ──
+    def triton_fa():
+        return triton_flash_attention(q, k, v, sm_scale)
+
+    triton_ms = timer.measure(triton_fa)
+
+    # ── 3. PyTorch SDPA ──
+    def torch_sdpa():
+        with torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.FLASH_ATTENTION]):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+    sdpa_ms = timer.measure(torch_sdpa)
+
+    # FLOPs: Q@K^T (2*B*H*S*S*d) + softmax (~5*B*H*S*S) + P@V (2*B*H*S*S*d)
     s2 = seq_len * seq_len
-    flops = batch * heads * (2 * s2 * head_dim + 5 * s2 + 2 * s2 * head_dim)
-    bytes_total = batch * heads * seq_len * head_dim * 2 * 3  # Q,K,V reads (fp16)
-    ai = compute_ai(flops, bytes_total)
+    flops = B * H * (4 * s2 * head_dim + 5 * s2)
+
+    # Bytes: KEY difference between implementations
+    # Naive: reads Q,K,V + writes S (S*S fp32) + reads S + writes O
+    naive_bytes = B * H * (
+        seq_len * head_dim * 2 * 3   # Q,K,V reads (fp16)
+        + s2 * 4                      # S write (fp32)
+        + s2 * 4                      # S read for softmax
+        + s2 * 4                      # P read for P@V
+        + seq_len * head_dim * 2      # O write (fp16)
+    )
+
+    # FA: reads Q,K,V + writes O — no S matrix in global memory
+    fa_bytes = B * H * (
+        seq_len * head_dim * 2 * 3   # Q,K,V reads (fp16)
+        + seq_len * head_dim * 2     # O write (fp16)
+    )
+
+    ai_naive = compute_ai(flops, naive_bytes)
+    ai_fa = compute_ai(flops, fa_bytes)
+
+    # S matrix memory
+    s_mem_mb = B * H * s2 * 4 / 1e6
 
     results.append(KernelProfile(
-        name="SDPA (Flash)",
-        shape=(batch, heads, seq_len, head_dim),
-        triton_ms=0,  # Triton FA kernel not profiled separately
-        torch_ms=torch_ms,
+        name="Attention-Naive",
+        shape=(B, H, seq_len, head_dim),
+        triton_ms=0,
+        torch_ms=naive_ms,
         flops=flops,
-        bytes_read=batch * heads * seq_len * head_dim * 2 * 3,
-        bytes_written=batch * heads * seq_len * head_dim * 2,
-        ai=ai,
-        achieved_tflops=flops / (torch_ms * 1e9),
-        achieved_bw_gbs=bytes_total / (torch_ms * 1e6),
-        bound=classify_bound(ai),
-        notes="PyTorch SDPA (cuDNN FlashAttention)"
+        bytes_read=B * H * seq_len * head_dim * 2 * 3,
+        bytes_written=B * H * (s2 * 4 * 2 + seq_len * head_dim * 2),
+        ai=ai_naive,
+        achieved_tflops=flops / (naive_ms * 1e9),
+        achieved_bw_gbs=naive_bytes / (naive_ms * 1e6),
+        bound=classify_bound(ai_naive),
+        notes=f"S matrix: {s_mem_mb:.0f} MB (O(S²))"
     ))
+
+    results.append(KernelProfile(
+        name="Attention-TritonFA",
+        shape=(B, H, seq_len, head_dim),
+        triton_ms=triton_ms,
+        torch_ms=sdpa_ms,
+        flops=flops,
+        bytes_read=B * H * seq_len * head_dim * 2 * 3,
+        bytes_written=B * H * seq_len * head_dim * 2,
+        ai=ai_fa,
+        achieved_tflops=flops / (triton_ms * 1e9),
+        achieved_bw_gbs=fa_bytes / (triton_ms * 1e6),
+        bound=classify_bound(ai_fa),
+        notes=f"NO S matrix — SRAM only (vs {s_mem_mb:.0f} MB naive)"
+    ))
+
+    results.append(KernelProfile(
+        name="Attention-SDPA",
+        shape=(B, H, seq_len, head_dim),
+        triton_ms=0,
+        torch_ms=sdpa_ms,
+        flops=flops,
+        bytes_read=B * H * seq_len * head_dim * 2 * 3,
+        bytes_written=B * H * seq_len * head_dim * 2,
+        ai=ai_fa,
+        achieved_tflops=flops / (sdpa_ms * 1e9),
+        achieved_bw_gbs=fa_bytes / (sdpa_ms * 1e6),
+        bound=classify_bound(ai_fa),
+        notes="cuDNN FlashAttention (vendor-optimized)"
+    ))
+
     return results
 
 
@@ -499,8 +653,8 @@ if __name__ == "__main__":
         print("[3/4] Profiling Matmul...")
         all_results.extend(profile_matmul(timer))
 
-        print("[4/4] Profiling Attention (SDPA)...")
-        all_results.extend(profile_flash_attention(timer))
+        print("[4/4] Profiling Attention (Naive vs Triton FA vs SDPA)...")
+        all_results.extend(profile_attention_all(timer))
 
         for p in all_results:
             print_profile(p)
