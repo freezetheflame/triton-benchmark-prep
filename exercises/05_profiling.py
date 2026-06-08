@@ -124,14 +124,20 @@ def softmax_online_kernel(x_ptr, out_ptr, n_rows, n_cols, BLOCK_SIZE: tl.constex
     start = row * n_cols
     m = -float('inf')
     d = 0.0
-    for i in range(n_cols):
-        x = tl.load(x_ptr + start + i)
-        m_new = tl.maximum(m, x)
-        d = d * tl.exp(m - m_new) + tl.exp(x - m_new)
-        m = m_new
-    for i in range(n_cols):
-        x = tl.load(x_ptr + start + i)
-        tl.store(out_ptr + start + i, tl.exp(x - m) / d)
+    # load more with a bigger block
+    for i in range(0,n_cols, BLOCK_SIZE):
+        off =  i + tl.arange(0, BLOCK_SIZE)
+        mask = off < n_cols
+        x = tl.load(x_ptr + off + start, mask=mask, other=-float('inf')).to(tl.float32)
+        m_new = tl.maximum(m, tl.max(x))
+        d_new = d * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new))
+        m, d = m_new, d_new
+    # Store results in blocks — single-element loads kill GPU perf
+    for i in range(0, n_cols, BLOCK_SIZE):
+        off = i + tl.arange(0, BLOCK_SIZE)
+        mask_out = off < n_cols
+        x_out = tl.load(x_ptr + start + off, mask=mask_out, other=-float('inf')).to(tl.float32)
+        tl.store(out_ptr + start + off, tl.exp(x_out - m) / d, mask=mask_out)
 
 
 @triton.jit
@@ -153,14 +159,17 @@ def matmul_kernel(a_ptr, b_ptr, c_ptr,
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=rm[:, None] < M and rk[None, :] < K - k)
-        b = tl.load(b_ptrs, mask=rk[:, None] < K - k and rn[None, :] < N)
+        a_mask = (rm[:, None] < M) & (rk[None, :] < K - k)
+        b_mask = (rk[:, None] < K - k) & (rn[None, :] < N)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
     c_ptrs = c_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, acc, mask=rm[:, None] < M and rn[None, :] < N)
+    c_mask = (rm[:, None] < M) & (rn[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
 
 
 # ═══════════════════════════════════════════════════════════
