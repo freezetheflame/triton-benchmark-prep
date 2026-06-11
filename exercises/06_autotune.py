@@ -49,11 +49,20 @@ import triton.language as tl
 #
 # Fill in 8-12 configs that explore the space:
 AUTOTUNE_CONFIGS = [
-    # ── YOUR CODE: add configs ──
-    # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
-    # triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
-    # ...
-    # ── END ──
+    # Small tiles — high occupancy, less compute per load
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    # Medium tiles — balanced
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4, num_stages=3),
+    # Big tiles — more compute per load, fewer CTAs per SM (num_warps=8 for more threads)
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+    # num_stages variation
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=4),
 ]
 
 
@@ -68,13 +77,27 @@ AUTOTUNE_CONFIGS = [
 # Example: if BLOCK_K > K, same thing.
 #
 # Return True to KEEP, False to PRUNE.
-def prune_config(configs):
-    """Called for each (M, N, K) to filter configs."""
-    # ── YOUR CODE ──
-    # You might want to keep only configs where BLOCK_M ≤ M, etc.
-    # or keep all configs for now and let the benchmark sort them out
-    return configs  # no pruning for now
-    # ── END ──
+def prune_config(configs, named_args, **kwargs):
+    """Called once per (M, N, K) to filter non-viable configs.
+    
+    named_args is a dict like {'M': 1024, 'N': 1024, 'K': 1024, ...}
+    **kwargs carries extra args (grid, etc.) — ignore them.
+    Return the list of configs to keep.
+    """
+    M = named_args['M']
+    N = named_args['N']
+    K = named_args['K']
+    
+    pruned = []
+    for cfg in configs:
+        kw = cfg.kwargs
+        # BLOCK size must not exceed the dimension it tiles
+        if kw['BLOCK_M'] > M or kw['BLOCK_N'] > N or kw['BLOCK_K'] > K:
+            continue
+        # Single-CTP configs need enough warps for the work
+        # (BLOCK_M * BLOCK_N) / (num_warps * 32) should be reasonable
+        pruned.append(cfg)
+    return pruned
 
 
 # ═══════════════════════════════════════════════════════════
@@ -93,7 +116,11 @@ def prune_config(configs):
 #
 # NOTE: After adding autotune, do NOT pass BLOCK_M/N/K as grid arguments.
 # The decorator injects them from the winning config.
-
+@triton.autotune(
+        key=['M', 'N', 'K'],
+        configs=AUTOTUNE_CONFIGS,
+        prune_configs_by={'early_config_prune': prune_config}
+)
 @triton.jit
 def matmul_autotuned_kernel(
     a_ptr, b_ptr, c_ptr,
@@ -155,8 +182,16 @@ def matmul_autotuned(a: torch.Tensor, b: torch.Tensor):
     c = torch.empty(M, N, device=a.device, dtype=a.dtype)
 
     # ── YOUR CODE: call matmul_autotuned_kernel ──
-    # grid = ?
-    # matmul_autotuned_kernel[grid](a, b, c, M, N, K_input, ...)
+    # grid must be a LAMBDA receiving META — the autotuner injects BLOCK sizes via META
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    matmul_autotuned_kernel[grid](
+        a, b, c,
+        M, N, K_input,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        # BLOCK_M, BLOCK_N, BLOCK_K are NOT passed — autotune injects from META
+    )
     # ── END ──
     
     return c
@@ -193,7 +228,10 @@ def benchmark():
         try:
             yours = matmul_autotuned(a, b)
             max_err = (yours.float() - ref.float()).abs().max().item()
-            status = "✓" if max_err < 0.02 else "✗"
+            # fp16 matmul: typical output values ~100-300, 1 ULP ≈ 0.25
+            # rtol=1e-2 means ~2.5 at value=250, atol=1.0 catches outliers
+            ok = torch.allclose(yours.float(), ref.float(), rtol=1e-2, atol=1.0)
+            status = "✓" if ok else "✗"
             print(f"  {M}×{K}×{N}: max_err={max_err:.6f} {status}")
         except Exception as e:
             print(f"  {M}×{K}×{N}: ERROR — {e}")
